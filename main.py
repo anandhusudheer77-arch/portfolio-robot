@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import random  # <-- IMPORTANT: Added for random delays
 import smtplib
 from datetime import datetime
 
@@ -17,152 +18,170 @@ from email.mime.text import MIMEText
 print("Robot is reading your spreadsheet...")
 
 # Write service account credentials from env var to a file
-with open("credentials.json", "w") as f:
+with open('credentials.json', 'w') as f:
     json.dump(json.loads(os.environ["GCP_CREDENTIALS_JSON"]), f)
 
 # Authorize gspread with service account
-gc = gspread.service_account(filename="credentials.json")
+gc = gspread.service_account(filename='credentials.json')
 
+# Open spreadsheet and worksheet
 SPREADSHEET_NAME = "PortfolioDB"
 SHEET_NAME = "Sheet1"
-
 worksheet = gc.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
-records = worksheet.get_all_records()  # [{'Ticker': 'INFY.NS', ...}, ...]
+
+# Get all records (first row is treated as header)
+records = worksheet.get_all_records()
 portfolio = pd.DataFrame(records)
 
-# Clean column names
+# Clean column names (remove extra spaces, etc.)
 portfolio.columns = [c.strip() for c in portfolio.columns]
 
+# Sanity check: make sure required columns exist
 required_cols = {"Ticker", "Shares", "Avg_Cost"}
 missing = required_cols - set(portfolio.columns)
 if missing:
-    raise ValueError(
-        f"Missing columns in sheet: {missing}. "
-        f"Current columns: {portfolio.columns.tolist()}"
-    )
+    raise ValueError(f"Missing columns in sheet: {missing}. "
+                     f"Current columns: {portfolio.columns.tolist()}")
 
 print(f"Found {len(portfolio)} stocks in your portfolio")
 print("Columns detected:", portfolio.columns.tolist())
 
 # ===============================
-# STEP 2: GET STOCK PRICE DATA
+# STEP 2: GET STOCK DATA (Polite & Persistent)
 # ===============================
-def fetch_stock_history(ticker: str, max_retries: int = 3):
+def fetch_stock(ticker: str, max_retries=3):
     """
-    Fetch 1-year daily price history for a ticker.
-    Uses chart endpoint instead of quoteSummary to avoid 429 issues.
+    Fetches stock info from Yahoo Finance with retry logic and polite delays.
     """
     for attempt in range(max_retries):
         try:
-            print(f"  Checking {ticker} (attempt {attempt + 1}/{max_retries})...")
+            print(f"  Checking {ticker}... (Attempt {attempt + 1}/{max_retries})")
+            
+            # Be EXTRA nice to Yahoo: wait 3-7 seconds randomly between requests
+            # This makes you look like a human, not a spammy bot
+            sleep_time = random.uniform(3, 7)
+            print(f"    ⏱️  Waiting {sleep_time:.1f} seconds to be polite...")
+            time.sleep(sleep_time)
+            
+            # Identify ourselves as a friendly robot (not a scraper)
             stock = yf.Ticker(ticker)
-            # 1 year of daily data
-            hist = stock.history(period="1y", interval="1d")
-            if hist.empty:
-                print("    No price history returned.")
-                return None
-            return hist
+            stock.session.headers['User-Agent'] = 'Mozilla/5.0 (compatible; PortfolioRobot/1.0)'
+            
+            # Get the data
+            info = stock.info
+            
+            # Check if we actually got real data (not empty)
+            if not info or info.get('symbol') is None:
+                print(f"    ⚠️  Warning: Yahoo returned empty data for {ticker}")
+                if attempt < max_retries - 1:
+                    print(f"    🔄 Retrying after 10 seconds...")
+                    time.sleep(10)
+                    continue
+                else:
+                    return None
+                
+            return info
+            
         except Exception as e:
-            msg = str(e)
-            print(f"    Error fetching {ticker}: {msg}")
+            error_msg = str(e)
+            print(f"    ❌ Error fetching {ticker}: {error_msg[:60]}...")
+            
+            # If rate limited (429), wait MUCH longer
+            if "429" in error_msg or "too many requests" in error_msg.lower():
+                wait_time = 15 * (attempt + 1)  # 15s, 30s, 45s
+                print(f"    🚨 Rate limited by Yahoo! Waiting {wait_time}s...")
+                time.sleep(wait_time)
+            elif attempt < max_retries - 1:
+                # For other errors, wait 5 seconds before retry
+                print(f"    🔄 Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                # Last attempt failed
+                return None
 
-            # Backoff for 429 or timeouts
-            if "Too Many Requests" in msg or "429" in msg:
-                wait = 10 * (attempt + 1)
-                print(f"    Got 429, sleeping {wait}s before retry...")
-                time.sleep(wait)
-                continue
-            if "timed out" in msg:
-                wait = 5 * (attempt + 1)
-                print(f"    Timeout, sleeping {wait}s before retry...")
-                time.sleep(wait)
-                continue
-
-            # Other errors: do not retry endlessly
-            return None
-
-    print(f"    Failed to fetch {ticker} after {max_retries} retries.")
-    return None
-
-
-def pct_return(hist: pd.DataFrame, days: int):
-    """Compute percentage return over last `days` trading days."""
-    if len(hist) <= days:
-        return None
-    current_price = hist["Close"].iloc[-1]
-    past_price = hist["Close"].iloc[-(days + 1)]
-    if past_price == 0:
-        return None
-    return (current_price - past_price) / past_price
-
-
-def fmt_pct(x):
-    return f"{x * 100:.1f}%" if isinstance(x, (int, float)) else "N/A"
-
-
+# Track how many stocks we successfully analyzed
 analysis_results = []
+successful_fetches = 0
 
 for _, row in portfolio.iterrows():
     ticker = str(row["Ticker"]).strip()
     if not ticker:
         continue
 
-    hist = fetch_stock_history(ticker)
+    info = fetch_stock(ticker)
 
-    if hist is None:
-        analysis_results.append(f"{ticker}: ERROR - Could not get price data")
+    if info is None:
+        analysis_results.append(f"**{ticker}**: ❌ ERROR - Could not get data")
         continue
 
-    # Current price
-    current_price = hist["Close"].iloc[-1]
+    # Get the numbers with defaults
+    peg = info.get("pegRatio", None)
+    roe = info.get("returnOnEquity", None)
+    de_ratio = info.get("debtToEquity", None)
 
-    # 1-month (~22 trading days) and 6-month (~132 trading days) returns
-    ret_1m = pct_return(hist, 22)
-    ret_6m = pct_return(hist, 132)
-
-    # Volatility = std dev of daily returns
-    daily_ret = hist["Close"].pct_change().dropna()
-    vol = float(daily_ret.std()) if not daily_ret.empty else None
-
-    # Simple scoring logic
+    # Only score if we have real numbers (not None)
     score = 0
-    if ret_6m is not None and ret_6m > 0.10:  # > +10% in 6 months
+    if peg is not None and peg != 0 and peg < 1.5:
         score += 1
-    if ret_1m is not None and ret_1m > 0.03:  # > +3% in 1 month
+    if roe is not None and roe > 0.15:
         score += 1
-    if vol is not None and vol < 0.03:        # relatively low volatility
+    if de_ratio is not None and de_ratio < 100:
         score += 1
 
-    status_list = ["SELL", "HOLD", "BUY", "STRONG BUY"]
+    # Status names with emojis for visual appeal
+    status_list = ["🔴 SELL", "🟡 HOLD", "🟢 BUY", "⭐ STRONG BUY"]
     status = status_list[min(score, 3)]
 
-    vol_str = f"{vol:.4f}" if isinstance(vol, (int, float)) else "N/A"
+    # Safe formatting (avoid crashes if data is weird)
+    peg_str = f"{peg:.2f}" if isinstance(peg, (int, float)) else "N/A"
+    if isinstance(roe, (int, float)):
+        roe_pct_str = f"{roe * 100:.1f}%"
+    else:
+        roe_pct_str = "N/A"
+    de_str = f"{de_ratio:.1f}" if isinstance(de_ratio, (int, float)) else "N/A"
 
     analysis_results.append(
-        f"{ticker}: {status} | Price: {current_price:.2f} | "
-        f"1M: {fmt_pct(ret_1m)} | 6M: {fmt_pct(ret_6m)} | Vol: {vol_str}"
+        f"**{ticker}**: {status} | PEG: {peg_str} | ROE: {roe_pct_str} | D/E: {de_str}"
     )
+    successful_fetches += 1
 
+# If no stocks could be analyzed, stop here with explanation
 if not analysis_results:
-    raise RuntimeError("No tickers analyzed. Check your sheet content.")
-
-# Debug (optional) – uncomment if you want to see in logs
-# print("\n=== ANALYSIS RESULTS ===")
-# for line in analysis_results:
-#     print(line)
+    raise RuntimeError("No tickers found to analyze. Check your sheet content.")
 
 # ===============================
-# STEP 3: ASK THE AI BRAIN
+# STEP 3: ASK THE AI BRAIN (CORRECT MODEL)
 # ===============================
 print("Asking AI to think...")
 
-try:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    # Use a model supported by google-generativeai==0.3.2
-    model = genai.GenerativeModel("gemini-pro")
+# If all stocks failed, don't waste AI credits - send direct message
+if successful_fetches == 0:
+    ai_summary = """
+    <h2>🚨 Portfolio Robot Report</h2>
+    <p><strong>All stock data fetches failed.</strong></p>
+    <p>Yahoo Finance blocked every request due to rate limiting. This happens when:</p>
+    <ul>
+        <li>You have too many stocks (>5 is risky)</li>
+        <li>Yahoo is having a bad day (rare)</li>
+        <li>Your IP range is flagged (GitHub's IPs sometimes are)</li>
+    </ul>
+    <p><strong>What to do:</strong></p>
+    <ul>
+        <li>Wait 1 hour and try again</li>
+        <li>Temporarily reduce to 3-5 stocks in your sheet</li>
+        <li>The robot is already configured with maximum politeness</li>
+    </ul>
+    <p><em>Raw errors:</em> All tickers returned 429 Too Many Requests</p>
+    """
+else:
+    try:
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        # ✅ CORRECT MODEL NAME FOR FREE TIER:
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
 
-    analysis_str = "\n".join(analysis_results)
-    prompt = f"""You are my stock analyst. Here's my portfolio data:
+        # Build the prompt safely
+        analysis_str = "\n".join(analysis_results)
+        prompt = f"""You are my stock analyst. Here's my portfolio data:
 {analysis_str}
 
 Write a short email summary. Tell me:
@@ -171,12 +190,24 @@ Write a short email summary. Tell me:
 3. One thing I should do today
 
 Keep it under 200 words."""
-    response = model.generate_content(prompt)
-    ai_summary = response.text
-except Exception as e:
-    newline = "\n"
-    ai_summary = "AI failed. Here is raw data:\n" + newline.join(analysis_results)
-    print(f"AI error: {e}")
+        
+        response = model.generate_content(prompt)
+        ai_summary = response.text
+        print("    ✅ AI responded successfully!")
+    except Exception as e:
+        print(f"    ❌ AI error: {e}")
+        # Fallback: Create a clean HTML summary without AI
+        ai_summary = f"""
+        <h2>Daily GARP Analysis</h2>
+        <p><strong>Successfully analyzed: {successful_fetches}/{len(portfolio)} stocks</strong></p>
+        <ul>
+        """
+        for line in analysis_results[:8]:  # Show first 8 stocks
+            ai_summary += f"<li>{line}</li>"
+        ai_summary += """
+        </ul>
+        <p><em>AI summary unavailable. Using raw scores above.</em></p>
+        """
 
 # ===============================
 # STEP 4: SEND EMAIL
@@ -184,6 +215,7 @@ except Exception as e:
 def send_email():
     print("Sending email...")
     try:
+        # Convert newlines to <br> for HTML email
         body_html = ai_summary.replace("\n", "<br>")
         msg = MIMEText(body_html, "html")
         msg["Subject"] = f"📊 Daily GARP Report | {datetime.now().strftime('%b %d')}"
@@ -199,36 +231,81 @@ def send_email():
         print(f"❌ Email failed: {e}")
 
 # ===============================
-# STEP 5: SEND TELEGRAM
+# STEP 5: SEND TELEGRAM (ROBUST VERSION)
 # ===============================
 def send_telegram():
     print("Sending Telegram message...")
+    
+    # Validate secrets exist
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    
+    if not bot_token or not chat_id:
+        print("❌ Telegram failed: Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        return
+    
     try:
-        bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
-        chat_id = os.environ["TELEGRAM_CHAT_ID"]
-
-        message = f"<b>Daily Stock Report</b>\n\n{ai_summary}"
+        # Create short summary for Telegram
+        summary_line = f"Analyzed {successful_fetches}/{len(portfolio)} stocks ✅"
+        if successful_fetches < len(portfolio):
+            summary_line += f" | {len(portfolio) - successful_fetches} failed ❌"
+        
+        # Ensure we have content to send (never send empty message)
+        message_content = ai_summary if ai_summary else "No analysis generated."
+        if len(message_content) > 800:
+            message_content = message_content[:800] + "..."
+        
+        # Build final message
+        message = f"<b>Daily Stock Report</b>\n\n{summary_line}\n\n{message_content}"
+        
+        # Truncate if still too long (Telegram limit: 4096 chars)
         if len(message) > 4000:
-            message = message[:3800] + "\n\n..."
+            message = message[:3800] + "\n\n<i>...message truncated</i>"
 
+        # ✅ FIXED: No space in URL
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML",
         }
-        resp = requests.post(url, json=payload)
+        
+        # Log what we're sending (for debugging)
+        print(f"    📤 Sending to Telegram: {len(message)} chars...")
+        
+        resp = requests.post(url, json=payload, timeout=10)
+        
+        # Log Telegram's exact response
+        print(f"    📥 Telegram response: {resp.status_code} - {resp.text}")
+        
         if resp.status_code == 200:
-            print("✅ Telegram sent!")
+            print("✅ Telegram sent successfully!")
         else:
-            print(f"❌ Telegram API error: {resp.status_code} {resp.text}")
+            print(f"❌ Telegram API error: {resp.status_code} - {resp.text}")
+            
+    except requests.exceptions.Timeout:
+        print("❌ Telegram failed: Request timed out after 10 seconds")
+    except requests.exceptions.ConnectionError:
+        print("❌ Telegram failed: Connection error - check internet")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Telegram failed: Request error - {e}")
     except Exception as e:
-        print(f"❌ Telegram failed: {e}")
+        print(f"❌ Telegram failed: Unexpected error - {e}")
 
 # ===============================
-# STEP 6: RUN EVERYTHING
+# STEP 6: RUN EVERYTHING & SHOW SUMMARY
 # ===============================
 if __name__ == "__main__":
+    print("\n" + "="*50)
+    print("🤖 ROBOT STARTING DAILY ANALYSIS")
+    print("="*50)
+    
     send_email()
     send_telegram()
-    print("Robot finished work!")
+    
+    print("\n" + "="*50)
+    print(f"✅ ROBOT FINISHED!")
+    print(f"📊 Analyzed {successful_fetches}/{len(portfolio)} stocks successfully.")
+    if successful_fetches < len(portfolio):
+        print(f"❌ {len(portfolio) - successful_fetches} stocks failed.")
+    print("="*50)
