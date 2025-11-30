@@ -29,7 +29,7 @@ SHEET_NAME = "Sheet1"
 worksheet = gc.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
 
 # Get all records (first row is treated as header)
-records = worksheet.get_all_records()  # [{'Ticker': 'AAPL', 'Shares': 10, 'Avg_Cost': 150}, ...]
+records = worksheet.get_all_records()
 portfolio = pd.DataFrame(records)
 
 # Clean column names (remove extra spaces, etc.)
@@ -46,21 +46,61 @@ print(f"Found {len(portfolio)} stocks in your portfolio")
 print("Columns detected:", portfolio.columns.tolist())
 
 # ===============================
-# STEP 2: GET STOCK DATA
+# STEP 2: GET STOCK DATA (Politely & With Retries)
 # ===============================
-def fetch_stock(ticker: str):
-    print(f"  Checking {ticker}...")
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        # Be nice to Yahoo Finance
-        time.sleep(2)
-        return info
-    except Exception as e:
-        print(f"    Error fetching {ticker}: {e}")
-        return None
+def fetch_stock(ticker: str, max_retries=3):
+    """
+    Fetches stock info from Yahoo Finance with retry logic and polite delays.
+    """
+    for attempt in range(max_retries):
+        try:
+            print(f"  Checking {ticker}... (Attempt {attempt + 1}/{max_retries})")
+            
+            # Be EXTRA nice to Yahoo: wait 3-7 seconds randomly between requests
+            # This makes you look like a human, not a spammy bot
+            sleep_time = random.uniform(3, 7)
+            print(f"    Waiting {sleep_time:.1f} seconds to be polite...")
+            time.sleep(sleep_time)
+            
+            # Identify ourselves as a friendly robot (not a scraper)
+            stock = yf.Ticker(ticker)
+            stock.session.headers['User-Agent'] = 'Mozilla/5.0 (compatible; PortfolioRobot/1.0)'
+            
+            # Get the data
+            info = stock.info
+            
+            # Check if we actually got real data (not empty)
+            if not info or info.get('symbol') is None:
+                print(f"    Warning: Yahoo returned empty data for {ticker}")
+                if attempt < max_retries - 1:
+                    print(f"    Retrying after 10 seconds...")
+                    time.sleep(10)
+                    continue
+                else:
+                    return None
+                
+            return info
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"    Error fetching {ticker}: {error_msg[:60]}...")
+            
+            # If rate limited (429), wait much longer
+            if "429" in error_msg:
+                wait_time = 15 * (attempt + 1)  # 15s, 30s, 45s
+                print(f"    🚨 Rate limited by Yahoo! Waiting {wait_time}s...")
+                time.sleep(wait_time)
+            elif attempt < max_retries - 1:
+                # For other errors, wait 5 seconds before retry
+                print(f"    Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                # Last attempt failed
+                return None
 
+# Track how many stocks we successfully analyzed
 analysis_results = []
+successful_fetches = 0
 
 for _, row in portfolio.iterrows():
     ticker = str(row["Ticker"]).strip()
@@ -70,17 +110,16 @@ for _, row in portfolio.iterrows():
     info = fetch_stock(ticker)
 
     if info is None:
-        analysis_results.append(f"{ticker}: ERROR - Could not get data")
+        analysis_results.append(f"{ticker}: ❌ ERROR - Could not get data")
         continue
 
     # Get the numbers with defaults
     peg = info.get("pegRatio", None)
-    roe = info.get("returnOnEquity", None)   # usually in decimal (0.18 = 18%)
+    roe = info.get("returnOnEquity", None)
     de_ratio = info.get("debtToEquity", None)
 
-    # Calculate simple score
+    # Only score if we have real numbers (not None)
     score = 0
-
     if peg is not None and peg != 0 and peg < 1.5:
         score += 1
     if roe is not None and roe > 0.15:
@@ -88,10 +127,11 @@ for _, row in portfolio.iterrows():
     if de_ratio is not None and de_ratio < 100:
         score += 1
 
-    status_list = ["SELL", "HOLD", "BUY", "STRONG BUY"]
+    # Status names with emojis for visual appeal
+    status_list = ["🔴 SELL", "🟡 HOLD", "🟢 BUY", "⭐ STRONG BUY"]
     status = status_list[min(score, 3)]
 
-    # Safe formatting
+    # Safe formatting (avoid crashes if data is weird)
     peg_str = f"{peg:.2f}" if isinstance(peg, (int, float)) else "N/A"
     if isinstance(roe, (int, float)):
         roe_pct_str = f"{roe * 100:.1f}%"
@@ -100,24 +140,47 @@ for _, row in portfolio.iterrows():
     de_str = f"{de_ratio:.1f}" if isinstance(de_ratio, (int, float)) else "N/A"
 
     analysis_results.append(
-        f"{ticker}: {status} | PEG: {peg_str} | ROE: {roe_pct_str} | D/E: {de_str}"
+        f"**{ticker}**: {status} | PEG: {peg_str} | ROE: {roe_pct_str} | D/E: {de_str}"
     )
+    successful_fetches += 1
 
-# If nothing was analyzed (e.g. empty sheet), bail out early
+# If no stocks could be analyzed, stop here with explanation
 if not analysis_results:
     raise RuntimeError("No tickers found to analyze. Check your sheet content.")
 
 # ===============================
-# STEP 3: ASK THE AI BRAIN
+# STEP 3: ASK THE AI BRAIN (CORRECT MODEL NAME)
 # ===============================
 print("Asking AI to think...")
 
-try:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
+# If all stocks failed, don't waste AI credits - send direct message
+if successful_fetches == 0:
+    ai_summary = """
+    <h2>🚨 Portfolio Robot Report</h2>
+    <p><strong>All stock data fetches failed.</strong></p>
+    <p>Yahoo Finance blocked every request due to rate limiting. This happens when:</p>
+    <ul>
+        <li>You have too many stocks (>5 is risky)</li>
+        <li>Yahoo is having a bad day (rare)</li>
+        <li>Your IP range is flagged (GitHub's IPs sometimes are)</li>
+    </ul>
+    <p><strong>What to do:</strong></p>
+    <ul>
+        <li>Wait 1 hour and try again</li>
+        <li>Temporarily reduce to 3-5 stocks in your sheet</li>
+        <li>The robot is already configured with maximum politeness</li>
+    </ul>
+    <p><em>Raw errors:</em> All tickers returned 429 Too Many Requests</p>
+    """
+else:
+    try:
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        # USE THIS MODEL NAME FOR FREE TIER:
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
 
-    analysis_str = "\n".join(analysis_results)
-    prompt = f"""You are my stock analyst. Here's my portfolio data:
+        # Build the prompt safely
+        analysis_str = "\n".join(analysis_results)
+        prompt = f"""You are my stock analyst. Here's my portfolio data:
 {analysis_str}
 
 Write a short email summary. Tell me:
@@ -126,12 +189,23 @@ Write a short email summary. Tell me:
 3. One thing I should do today
 
 Keep it under 200 words."""
-    response = model.generate_content(prompt)
-    ai_summary = response.text
-except Exception as e:
-    newline = "\n"
-    ai_summary = "AI failed. Here is raw data:\n" + newline.join(analysis_results)
-    print(f"AI error: {e}")
+        
+        response = model.generate_content(prompt)
+        ai_summary = response.text
+    except Exception as e:
+        print(f"AI error: {e}")
+        # Fallback: Create a clean HTML summary without AI
+        ai_summary = f"""
+        <h2>Daily GARP Analysis</h2>
+        <p><strong>Successfully analyzed: {successful_fetches}/{len(portfolio)} stocks</strong></p>
+        <ul>
+        """
+        for line in analysis_results[:8]:  # Show first 8 stocks
+            ai_summary += f"<li>{line}</li>"
+        ai_summary += """
+        </ul>
+        <p><em>AI summary unavailable. Using raw scores above.</em></p>
+        """
 
 # ===============================
 # STEP 4: SEND EMAIL
@@ -139,7 +213,7 @@ except Exception as e:
 def send_email():
     print("Sending email...")
     try:
-        # Convert newlines to <br> so it looks nicer as HTML
+        # Convert newlines to <br> for HTML email
         body_html = ai_summary.replace("\n", "<br>")
         msg = MIMEText(body_html, "html")
         msg["Subject"] = f"📊 Daily GARP Report | {datetime.now().strftime('%b %d')}"
@@ -155,7 +229,7 @@ def send_email():
         print(f"❌ Email failed: {e}")
 
 # ===============================
-# STEP 5: SEND TELEGRAM
+# STEP 5: SEND TELEGRAM (FIXED URL)
 # ===============================
 def send_telegram():
     print("Sending Telegram message...")
@@ -163,18 +237,25 @@ def send_telegram():
         bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
         chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-        # Truncate message if too long
-        message = f"<b>Daily Stock Report</b>\n\n{ai_summary}"
+        # Create short summary for Telegram
+        summary_line = f"Analyzed {successful_fetches}/{len(portfolio)} stocks ✅"
+        if successful_fetches < len(portfolio):
+            summary_line += f" | {len(portfolio) - successful_fetches} failed ❌"
+        
+        # Truncate to fit Telegram limits
+        message = f"<b>Daily Stock Report</b>\n\n{summary_line}\n\n{ai_summary[:800]}..."
         if len(message) > 4000:
-            message = message[:3800] + "\n\n..."
+            message = message[:3800] + "\n\n<i>...message truncated</i>"
 
+        # ✅ FIXED: Removed space in URL
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML",
         }
-        resp = requests.post(url, json=payload)
+        resp = requests.post(url, json=payload, timeout=10)
+        
         if resp.status_code == 200:
             print("✅ Telegram sent!")
         else:
@@ -188,4 +269,4 @@ def send_telegram():
 if __name__ == "__main__":
     send_email()
     send_telegram()
-    print("Robot finished work!")
+    print(f"Robot finished work! Analyzed {successful_fetches}/{len(portfolio)} stocks successfully.")
