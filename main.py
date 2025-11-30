@@ -7,6 +7,7 @@ from email.mime.text import MIMEText
 import requests
 import google.generativeai as genai
 from datetime import datetime
+import numpy as np
 
 # --- STEP 1: READ YOUR SPREADSHEET ---
 print("Robot is reading your spreadsheet...")
