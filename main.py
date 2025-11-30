@@ -61,21 +61,22 @@ print("Asking AI to think...")
 try:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel('gemini-1.5-flash')
-    
+
     prompt = f"""You are my stock analyst. Here's my portfolio data:
-{'\n'.join(analysis_results)}
-
-Write a short email summary. Tell me:
-1. My best stock right now
-2. My biggest risk
-3. One thing I should do today
-
-Keep it under 200 words."""
+    {chr(10).join(analysis_results)}
     
+    Write a short email summary. Tell me:
+    1. My best stock right now
+    2. My biggest risk
+    3. One thing I should do today
+    
+    Keep it under 200 words."""
+
     response = model.generate_content(prompt)
     ai_summary = response.text
 except Exception as e:
-    ai_summary = f"AI failed. Here is raw data:\n{'\n'.join(analysis_results)}"
+    newline = "\n"
+    ai_summary = "AI failed. Here is raw data:\n" + newline.join(analysis_results)
 
 # --- STEP 4: SEND EMAIL ---
 def send_email():
