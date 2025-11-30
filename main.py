@@ -62,15 +62,16 @@ try:
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     model = genai.GenerativeModel('gemini-1.5-flash')
 
+    analysis_str = '\n'.join(analysis_results)
     prompt = f"""You are my stock analyst. Here's my portfolio data:
-    {chr(10).join(analysis_results)}
-    
-    Write a short email summary. Tell me:
-    1. My best stock right now
-    2. My biggest risk
-    3. One thing I should do today
-    
-    Keep it under 200 words."""
+{analysis_str}
+
+Write a short email summary. Tell me:
+1. My best stock right now
+2. My biggest risk
+3. One thing I should do today
+
+Keep it under 200 words."""
 
     response = model.generate_content(prompt)
     ai_summary = response.text
